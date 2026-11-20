@@ -29,11 +29,18 @@
             state: present
             filename: docker
 
+        - name: "Fix interrupted dpkg state and remove conflicting distro packages"
+          ansible.builtin.shell: |
+            dpkg --configure -a || true
+            apt-get remove -y docker-compose-v2 docker.io || true
+          changed_when: false
+
         - name: "Install official Docker Engine and Docker Compose Plugin packages"
           ansible.builtin.apt:
             name: "{{ docker_packages }}"
             state: present
             update_cache: true
+            dpkg_options: 'force-confdef,force-confold,force-overwrite'
 
     - name: "Install Docker from distribution repository if official repository is geo-blocked (HTTP 403)"
       when: docker_gpg_download is failed
