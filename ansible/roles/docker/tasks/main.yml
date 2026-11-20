@@ -113,11 +113,18 @@
       }
     mode: '0644'
 
-- name: "Ensure Docker service is enabled and restarted with active mirrors"
+- name: "Reload systemd configuration"
   ansible.builtin.systemd:
-    name: docker
+    daemon_reload: true
+
+- name: "Ensure docker.socket and docker.service are enabled and restarted with active mirrors"
+  ansible.builtin.systemd:
+    name: "{{ item }}"
     state: restarted
     enabled: true
+  loop:
+    - docker.socket
+    - docker.service
 
 - name: "Add designated users to docker group"
   ansible.builtin.user:
