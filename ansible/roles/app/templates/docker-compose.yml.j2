@@ -28,6 +28,13 @@ services:
 {% for port in service.ports %}
       - {{ port | to_json }}
 {% endfor %}
+{% elif service.port is defined and service.port %}
+    ports:
+{% if ':' in (service.port | string) %}
+      - {{ service.port | to_json }}
+{% else %}
+      - "{{ service.port }}:{{ service.port }}"
+{% endif %}
 {% endif %}
 {% if service.depends_on is defined and service.depends_on %}
     depends_on:

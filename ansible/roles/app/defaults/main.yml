@@ -1,7 +1,6 @@
 ---
 app_name: "app"
 app_dir: "/opt/app"
-traefik_network: "traefik_proxy"
 registry_auth_enabled: false
 registry_url: "ghcr.io"
 registry_username: ""
