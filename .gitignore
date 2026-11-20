@@ -3,34 +3,24 @@
 .env.*
 !.env.example
 
-# Ansible Inventory & Host Secrets
-ansible/inventory/production/**
-!ansible/inventory/production/**/
-!ansible/inventory/production/**/*.example
-ansible/inventory/**/hosts.yml
-!ansible/inventory/**/hosts.yml.example
-ansible/vault/vault_pass.txt
-ansible/vault/*.secret
-
+# SSH Keys & Credentials (NEVER commit private keys)
+.ssh/
 *.pem
 *.key
 *.p12
 *.pfx
+ansible/vault/vault_pass.txt
+ansible/vault/*.secret
 
 # Node.js & Builds
 node_modules/
 dist/
 build/
 
-# Runtime Data & Storage
-/srv/
+# Runtime Data & Temporary Files
 backups/
 *.dump
 *.tmp
-
-# Traefik & SSL
-acme.json
-/srv/traefik/acme/
 
 # Ansible artifacts
 ansible/artifacts/

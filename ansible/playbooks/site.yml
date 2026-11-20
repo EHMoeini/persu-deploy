@@ -1,5 +1,5 @@
 ---
-- name: "DeployKit - Server Provisioning"
+- name: "Persu Deployment - Server Provisioning & App Stack"
   hosts: all
   become: true
   gather_facts: true
@@ -15,19 +15,13 @@
             (ansible_distribution in ["Rocky", "AlmaLinux", "RedHat"] and ansible_distribution_major_version | int >= 9)
         fail_msg: >
           [OS Incompatibility] Operating system '{{ ansible_distribution }} {{ ansible_distribution_version }}' is not supported.
-          DeployKit supports Ubuntu (22.04+), Debian (12+), Amazon Linux (2023), and EL9+ (Rocky, AlmaLinux, RHEL).
+          Supported distributions: Ubuntu (22.04+), Debian (12+), Amazon Linux (2023), and EL9+ (Rocky, AlmaLinux, RHEL).
         success_msg: "Operating system distribution and version are valid ({{ ansible_distribution }} {{ ansible_distribution_version }})."
 
   roles:
     - role: common
       tags: ["setup", "common"]
-    - role: security
-      tags: ["setup", "security"]
-    - role: firewall
-      tags: ["setup", "firewall"]
     - role: docker
       tags: ["setup", "docker"]
-    - role: traefik
-      tags: ["setup", "traefik"]
     - role: app
       tags: ["deploy", "app"]

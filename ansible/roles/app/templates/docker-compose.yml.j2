@@ -11,9 +11,6 @@ services:
 {% endif %}
     networks:
       - internal
-{% if service.expose_public | default(false) %}
-      - {{ traefik_network }}
-{% endif %}
 {% if service.env is defined and service.env %}
     environment:
 {% for key, value in service.env.items() %}
@@ -26,29 +23,23 @@ services:
       - {{ vol | to_json }}
 {% endfor %}
 {% endif %}
+{% if service.ports is defined and service.ports %}
+    ports:
+{% for port in service.ports %}
+      - {{ port | to_json }}
+{% endfor %}
+{% endif %}
 {% if service.depends_on is defined and service.depends_on %}
     depends_on:
 {% for dep in service.depends_on %}
       - {{ dep }}
 {% endfor %}
 {% endif %}
-{% if service.expose_public | default(false) %}
-    labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network={{ traefik_network }}"
-      - "traefik.http.routers.{{ app_name }}-{{ service.name }}.rule=Host(`{{ service.domain }}`)"
-      - "traefik.http.routers.{{ app_name }}-{{ service.name }}.entrypoints=websecure"
-      - "traefik.http.routers.{{ app_name }}-{{ service.name }}.tls=true"
-      - "traefik.http.routers.{{ app_name }}-{{ service.name }}.tls.certresolver=letsencrypt"
-      - "traefik.http.services.{{ app_name }}-{{ service.name }}.loadbalancer.server.port={{ service.port }}"
-{% endif %}
 
 {% endfor %}
 networks:
   internal:
     driver: bridge
-  {{ traefik_network }}:
-    external: true
 {% if app_named_volumes is defined and app_named_volumes | length > 0 %}
 
 volumes:

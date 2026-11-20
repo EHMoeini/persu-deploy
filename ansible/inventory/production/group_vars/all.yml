@@ -1,0 +1,85 @@
+---
+# ==========================================
+# 1. Server & System Settings
+# ==========================================
+timezone: "Asia/Tehran"
+ssh_port: 22
+deploy_user: "deploy"
+
+# ==========================================
+# 2. Container Registry Auth (GHCR is public)
+# ==========================================
+registry_auth_enabled: false
+registry_url: "ghcr.io"
+registry_username: ""
+registry_token: ""
+
+# ==========================================
+# 3. Application Stack
+# ==========================================
+app_name: "persu"
+app_dir: "/opt/app"
+
+# Persistent named volumes
+app_named_volumes:
+  - "postgres_data"
+
+# Application services
+app_services:
+  - name: "db"
+    image: "postgres:17-alpine"
+    env:
+      POSTGRES_DB: "persu"
+      POSTGRES_USER: "persu"
+      POSTGRES_PASSWORD: "iggbJTLg-8jw-NaN7jmLmGzxJq5jQK09"
+    volumes:
+      - "postgres_data:/var/lib/postgresql/data"
+    depends_on: []
+
+  - name: "redis"
+    image: "redis:7-alpine"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    env: {}
+    volumes: []
+    depends_on: []
+
+  - name: "backend"
+    image: "ghcr.io/ehmoeini/persu-backend:latest"
+    ports:
+      - "8000:8000"
+    command: ["sh", "-c", "until python -c \"import socket; s = socket.create_connection(('db', 5432), timeout=2); s.close()\" 2>/dev/null; do echo 'Waiting for postgres...'; sleep 1; done; python manage.py migrate --noinput && exec gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers ${GUNICORN_WORKERS:-3} --timeout ${GUNICORN_TIMEOUT:-60} --access-logfile - --error-logfile -"]
+    volumes: []
+    depends_on:
+      - "db"
+      - "redis"
+    env:
+      DB_ENGINE: "postgresql"
+      DB_HOST: "db"
+      DB_PORT: "5432"
+      DB_NAME: "persu"
+      DB_USER: "persu"
+      DB_PASSWORD: "iggbJTLg-8jw-NaN7jmLmGzxJq5jQK09"
+      REDIS_URL: "redis://redis:6379/1"
+      DJANGO_DEBUG: "false"
+      DJANGO_SECRET_KEY: "Qz-TxjH5h95qZA3mpD2v24J7U-q5a1irmNiy2gKmSh5EOI4wlce7xiRMrYLsuPgvI1g"
+      AUTH_JWT_SECRET: "hWANj0PxgKpzAEwOVBBBFkF_MTQgRC6cWHzt6x77UdJ0LEFXXNe48SZeYFfk3WrFW84"
+      DJANGO_ALLOWED_HOSTS: "api.persu.fpna.ir,persu.fpna.ir,192.168.6.222,localhost,127.0.0.1"
+      CSRF_TRUSTED_ORIGINS: "http://api.persu.fpna.ir:8000,http://persu.fpna.ir:3000,http://192.168.6.222:8000,http://192.168.6.222:3000"
+      CORS_ALLOWED_ORIGINS: "http://persu.fpna.ir:3000,http://192.168.6.222:3000"
+      AUTH_JWT_ISSUER: "http://api.persu.fpna.ir:8000"
+      AUTH_JWT_AUDIENCE: "http://persu.fpna.ir:3000"
+      PORT: "8000"
+      GUNICORN_WORKERS: "3"
+      GUNICORN_TIMEOUT: "60"
+
+  - name: "frontend"
+    image: "ghcr.io/ehmoeini/persu-frontend:latest"
+    ports:
+      - "3000:3000"
+    volumes: []
+    depends_on:
+      - "backend"
+    env:
+      NODE_ENV: "production"
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"

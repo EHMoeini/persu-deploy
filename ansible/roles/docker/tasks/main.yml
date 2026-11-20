@@ -8,25 +8,40 @@
         state: directory
         mode: '0755'
 
-    - name: "Download official Docker GPG key"
+    - name: "Attempt to download official Docker GPG key"
       ansible.builtin.get_url:
         url: "https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg"
         dest: "{{ docker_apt_keyring_path }}"
         mode: '0644'
+      register: docker_gpg_download
+      ignore_errors: true
 
-    - name: "Add official Docker APT repository"
-      ansible.builtin.apt_repository:
-        repo: >-
-          deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') | replace('aarch64', 'arm64') }}
-          signed-by={{ docker_apt_keyring_path }}]
-          https://download.docker.com/linux/{{ ansible_distribution | lower }}
-          {{ ansible_distribution_release }} stable
-        state: present
-        filename: docker
+    - name: "Configure official Docker repository when accessible"
+      when: docker_gpg_download is succeeded
+      block:
+        - name: "Add official Docker APT repository"
+          ansible.builtin.apt_repository:
+            repo: >-
+              deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') | replace('aarch64', 'arm64') }}
+              signed-by={{ docker_apt_keyring_path }}]
+              https://download.docker.com/linux/{{ ansible_distribution | lower }}
+              {{ ansible_distribution_release }} stable
+            state: present
+            filename: docker
 
-    - name: "Install official Docker Engine and Docker Compose Plugin packages"
+        - name: "Install official Docker Engine and Docker Compose Plugin packages"
+          ansible.builtin.apt:
+            name: "{{ docker_packages }}"
+            state: present
+            update_cache: true
+
+    - name: "Install Docker from distribution repository if official repository is geo-blocked (HTTP 403)"
+      when: docker_gpg_download is failed
       ansible.builtin.apt:
-        name: "{{ docker_packages }}"
+        name:
+          - docker.io
+          - docker-compose-v2
+          - docker-buildx
         state: present
         update_cache: true
 
@@ -71,10 +86,30 @@
               - docker-compose-plugin
             state: present
 
-- name: "Ensure Docker service is enabled and started"
+- name: "Ensure Docker configuration directory exists"
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    mode: '0755'
+
+- name: "Configure Docker daemon registry mirrors for geo-blocked environments"
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    content: |
+      {
+        "registry-mirrors": [
+          "https://docker.iranserver.com",
+          "https://docker.arvancloud.ir",
+          "https://docker.m1r.ir",
+          "https://registry.docker.ir"
+        ]
+      }
+    mode: '0644'
+
+- name: "Ensure Docker service is enabled and restarted with active mirrors"
   ansible.builtin.systemd:
     name: docker
-    state: started
+    state: restarted
     enabled: true
 
 - name: "Add designated users to docker group"
