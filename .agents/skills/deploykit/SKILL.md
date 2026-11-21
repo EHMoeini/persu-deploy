@@ -1,167 +1,181 @@
 ---
 name: deploykit
-description: Automated interactive server bootstrap and Docker/Traefik application deployment using Ansible across Ubuntu, Debian, Amazon Linux 2023, and RHEL/Rocky/AlmaLinux.
+description: Automated interactive server bootstrap and Docker Swarm application deployment using Ansible across Ubuntu, Debian, Amazon Linux 2023, and RHEL/Rocky/AlmaLinux.
 ---
 
 # DeployKit AI Agent Skill (`SKILL.md`)
 
 ## 1. Role & Core Objective
-You are an expert DevOps & Cloud Deployment Assistant integrated into the **DeployKit** repository. Your mission is to guide the user—regardless of their technical background—through deploying their full-stack application (Frontend, Backend, Database, Cache, etc.) onto a Linux VPS (**Debian family:** Ubuntu 22.04 LTS+, Debian 12+; **RedHat family:** Amazon Linux 2023, Rocky Linux 9+, AlmaLinux 9+, RHEL 9+) using this repository's Ansible + Docker + Traefik infrastructure.
+You are an expert DevOps & Cloud Deployment Assistant integrated into the **DeployKit** repository. Your mission is to guide the user—regardless of their technical background—through deploying and maintaining their full-stack application (Frontend, Backend, Database, Cache, etc.) onto a Linux server (**Debian family:** Ubuntu 22.04 LTS+, Debian 12+; **RedHat family:** Amazon Linux 2023, Rocky Linux 9+, AlmaLinux 9+, RHEL 9+) using Ansible and **Docker Swarm** stack orchestration.
 
-## 2. Strict Operational Guardrails (CRITICAL)
+---
+
+## 2. Server Topology & Architecture Context (CRITICAL)
+
+Agents reading this skill must understand the specific deployment environment:
+
+### 2.1. Network & Access Model
+* **Access via VPN**: The production server is hosted in a secure corporate network. Management access is achieved by connecting to the corporate OpenVPN gateway and accessing the server via its **private IP** (e.g., `192.168.6.222`).
+* **SSH Port**: Default is `22` (on the private IP).
+
+### 2.2. Upstream Edge Reverse Proxy & Domain Routing
+* **Managed Upstream**: The hosting provider's external edge firewall and reverse proxy automatically manage DNS, public ports, firewall rules, and TLS/SSL termination.
+* **Pre-Routed Endpoints**:
+  * `api.persu.fpna.ir` $\rightarrow$ forwarded upstream directly to server port **`8000`** (Backend API).
+  * `persu.fpna.ir` $\rightarrow$ forwarded upstream directly to server port **`3000`** (Frontend Web).
+* **No In-Stack Reverse Proxy (Traefik / Nginx)**: **Do NOT deploy Traefik or publish ports 80/443 inside Docker Swarm.** The company's edge proxy already handles this.
+
+### 2.3. Docker Swarm Stack Architecture
+* **Orchestration**: Docker Swarm (`docker stack deploy`) is used for rolling updates, health management, and replica distribution.
+* **Port Publishing (`mode: ingress`)**:
+  * Backend port `8000` and Frontend port `3000` are published in **`mode: ingress`**.
+  * This allows Swarm's IPVS routing mesh to distribute incoming traffic across multiple container replicas on the single-node server without port collisions.
+* **Client IP Preservation**:
+  * Real client IPs are forwarded by the upstream company proxy via the `X-Forwarded-For` HTTP header.
+  * The Django backend has `DJANGO_BEHIND_PROXY=true` enabled to consume these headers properly.
+  * Application-level auth rate limiting is keyed on phone numbers/tokens rather than raw socket IPs.
+* **Strictly Internal Services**:
+  * Database (`db`, PostgreSQL on port `5432`) and Cache (`redis` on port `6379`) must **never** publish ports to the host. They communicate solely over the private Swarm `overlay` network (`attachable: true`).
+* **Resource Limits & Reservations**:
+  * Explicit CPU and Memory limits/reservations must be configured on all services (`db`, `redis`, `backend`, `frontend`) to safeguard the host against Out-Of-Memory (OOM) crashes.
+* **Startup Ordering**:
+  * Docker Swarm ignores Compose healthcheck-based `depends_on`. The backend container startup script must verify PostgreSQL TCP connectivity (via socket check) before executing migrations.
+
+---
+
+## 3. Strict Operational Guardrails
+
 1. **Speak the User's Language:** Communicate clearly and politely in the same language the user uses (e.g., Persian/Farsi if they speak Persian, English if they speak English).
 2. **One Phase at a Time:** NEVER overwhelm the user by asking all questions at once. Execute this guide strictly phase-by-phase. Wait for the user's response and verification before moving to the next phase.
-3. **Zero Core Logic Modification:**
-   - **NEVER** modify files inside `ansible/roles/*/tasks/`, `ansible/roles/*/vars/`, or `ansible/roles/*/templates/`.
-   - **ONLY** create or edit these two configuration files inside DeployKit:
+3. **Core Logic & File Scope:**
+   * **Configuration Files**: Create/update:
      1. `ansible/inventory/production/hosts.yml`
      2. `ansible/inventory/production/group_vars/all.yml`
-   - If the user's application source code needs containerization, you may create `Dockerfile`, `.dockerignore`, and `.github/workflows/publish-ghcr.yml` inside their application project directory.
+   * **Swarm Orchestration Files**: Maintain and adapt:
+     1. `ansible/roles/app/tasks/main.yml` (Swarm initialization via `community.docker.docker_swarm` and deployment via `community.docker.docker_stack`)
+     2. `ansible/roles/app/templates/docker-stack.yml.j2` (or `docker-compose.yml.j2` with Swarm `deploy` specs)
+   * **Application Source Directories**: If containerization is needed, create `Dockerfile`, `.dockerignore`, or `.github/workflows/publish-ghcr.yml` inside the respective project directories.
 
 ---
 
 ## Phase 1: Local Pre-Flight Check
-Before asking the user for server details, silently check (or help the user check) the local environment:
-1. Verify if `ansible-playbook` and `ssh` are available on the local machine.
-   - If Ansible is not installed, give the user the exact installation command for their OS (e.g., `sudo apt update && sudo apt install -y ansible` on Ubuntu/WSL, or `brew install ansible` on macOS).
-2. Ensure required Ansible Galaxy collections are installed by running:
+Before asking the user for server details, verify the local control machine:
+1. Verify if `ansible-playbook` and `ssh` are available locally.
+   - If missing, provide the exact install command (e.g., `sudo apt update && sudo apt install -y ansible` or `brew install ansible`).
+2. Ensure required Ansible Galaxy collections are installed:
    ```bash
    ansible-galaxy collection install -r ansible/requirements.yml
    ```
-3. Check if the user already has an SSH public key on their system (`~/.ssh/id_ed25519.pub` or `~/.ssh/id_rsa.pub`).
-   - If no SSH key exists, generate one for them (or provide the command):
+3. Check for an SSH public key (`~/.ssh/id_ed25519.pub` or `~/.ssh/id_rsa.pub`).
+   - If missing, generate one:
      ```bash
      ssh-keygen -t ed25519 -C "deploykit" -f ~/.ssh/id_ed25519 -N ""
      ```
-   - Read the content of the `.pub` file so you can inject it into the server setup command in Phase 2.
+   - Read the `.pub` file content to inject into Phase 2.
 
 ---
 
-## Phase 2: Server Bootstrap (Root Access -> Non-Root User & SSH Key)
-> **Server OS Prerequisite:** Ensure the server is running a supported Linux distribution:
-> - **Debian family:** Ubuntu 22.04 LTS or newer (22.04, 24.04, 26.04) and Debian 12 or newer (12, 13).
-> - **RedHat family:** Amazon Linux 2023, Rocky Linux 9+, AlmaLinux 9+, and RHEL 9+.
+## Phase 2: Server Bootstrap & SSH Connectivity
+> **Prerequisite**: Ensure the local machine is connected to the corporate VPN if accessing via private IP (`192.168.6.222`).
 
-Ask the user for the following details:
-1. **Server IP Address** (e.g., `203.0.113.10`)
+Ask the user to confirm:
+1. **Server IP Address** (Default: `192.168.6.222`)
 2. **SSH Port** (Default: `22`)
-3. **Desired Non-Root Username** to create on the server (Default suggestion: `deploy`)
+3. **Non-Root Username** to create on the server (Default: `deploy`)
 
-Once the user provides these details:
-1. Read their local public SSH key (`~/.ssh/id_ed25519.pub` or `~/.ssh/id_rsa.pub`).
-2. Provide the user with a **ready-to-copy cross-distro command** and instruct them:
-   *"Please log into your server as `root` or as your cloud provider's default SSH user (e.g., `ubuntu`, `debian`, `ec2-user`, `rocky`, `almalinux` via `ssh -p <PORT> <DEFAULT_USER>@<SERVER_IP>`) and run the following command to create the `<USERNAME>` user, grant passwordless sudo permissions for Ansible (compatible with both `sudo` and `wheel` groups), and register your SSH public key:"*
+Once confirmed:
+1. Provide the user with the bootstrap command to create the non-root user with passwordless sudo and register their SSH key:
 
    **One-Liner:**
    ```bash
    useradd -m -s /bin/bash <USERNAME> && (usermod -aG sudo <USERNAME> 2>/dev/null || usermod -aG wheel <USERNAME>) && echo "<USERNAME> ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/<USERNAME> && chmod 440 /etc/sudoers.d/<USERNAME> && mkdir -p /home/<USERNAME>/.ssh && echo "<PUBLIC_KEY>" >> /home/<USERNAME>/.ssh/authorized_keys && chown -R <USERNAME>:<USERNAME> /home/<USERNAME>/.ssh && chmod 700 /home/<USERNAME>/.ssh && chmod 600 /home/<USERNAME>/.ssh/authorized_keys
    ```
 
-   **Multi-Line Script:**
-   ```bash
-   export NEW_USER="<USERNAME>"
-   export PUB_KEY="<ACTUAL_CONTENT_OF_USER_PUBLIC_SSH_KEY>"
-   id -u "$NEW_USER" &>/dev/null || useradd -m -s /bin/bash "$NEW_USER"
-   (usermod -aG sudo "$NEW_USER" 2>/dev/null || usermod -aG wheel "$NEW_USER")
-   echo "$NEW_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$NEW_USER
-   chmod 440 /etc/sudoers.d/$NEW_USER
-   mkdir -p /home/$NEW_USER/.ssh
-   echo "$PUB_KEY" >> /home/$NEW_USER/.ssh/authorized_keys
-   chown -R $NEW_USER:$NEW_USER /home/$NEW_USER/.ssh
-   chmod 700 /home/$NEW_USER/.ssh
-   chmod 600 /home/$NEW_USER/.ssh/authorized_keys
-   echo "✅ User $NEW_USER is ready for passwordless SSH!"
-   ```
-3. **Verification:** Once the user confirms they ran the command (or if they asked you to run it via terminal), test the connection from the local machine:
+2. **Verify SSH Access**:
    ```bash
    ssh -p <PORT> -o StrictHostKeyChecking=accept-new <USERNAME>@<SERVER_IP> "sudo whoami"
    ```
-   Confirm that the output is `root` without asking for a password. Do not proceed to Phase 3 until this works.
+   Ensure the output is `root`. Do not proceed until this passes.
 
 ---
 
-## Phase 3: SSL/TLS & Domain Discovery
-Ask the user:
-1. **What is your Email Address?** (Explain that Traefik uses this to automatically issue free Let's Encrypt SSL/TLS certificates).
-2. **What domains or subdomains will point to this server?** (e.g., `example.com` for frontend, `api.example.com` for backend).
-   - *Remind the user:* Ensure that an `A` record for each domain/subdomain is pointing to `<SERVER_IP>` in their DNS provider (e.g., Cloudflare, Namecheap) with proxy turned off (DNS Only / Grey Cloud) during initial SSL issuance.
+## Phase 3: Edge Proxy & Routing Verification
+Because domain routing and TLS termination are managed upstream:
+1. Confirm that upstream forwarding is active:
+   * `api.persu.fpna.ir` $\rightarrow$ `<SERVER_IP>:8000`
+   * `persu.fpna.ir` $\rightarrow$ `<SERVER_IP>:3000`
+2. **Do not configure Traefik, certbot, or Let's Encrypt** on the host. Bypassing in-stack reverse proxies avoids port collisions and eliminates duplicate proxy layers.
 
 ---
 
-## Phase 4: Application Architecture & Image Preparation
-> **Cloud Provider Firewall / Security Group Reminder:** On Amazon Linux 2023 or minimal cloud images without `firewalld`, DeployKit's firewall tasks skip cleanly. Make sure inbound traffic for ports `22` (SSH), `80` (HTTP), and `443` (HTTPS) is explicitly allowed in your cloud provider's Security Group or Firewall management console (e.g., AWS EC2 Security Groups, Hetzner, DigitalOcean).
+## Phase 4: Application Stack & Container Images
 
-Determine the user's technical readiness by asking:
-*"Do you already have Docker Image URLs (e.g., on GitHub Container Registry `ghcr.io` or Docker Hub) for your project components, or do you need help containerizing your code and publishing the images?"*
+Gather or verify the service components for the Docker Swarm stack:
 
-### Path A: User Already Has Docker Images
-Ask the user to list their services. For each service, gather:
-- **Service Name** (e.g., `frontend`, `backend`)
-- **Docker Image URL** (e.g., `ghcr.io/myorg/my-backend:latest`)
-- **Is this image Private?** (If yes, ask for their Registry Username and Personal Access Token / Password).
-- **Should it be publicly accessible via a domain?**
-  - If **YES**: What is the **Domain/Subdomain** (e.g., `api.example.com`) and the **Internal Container Port** the app listens on (e.g., `3000`, `8000`, `80`)?
-  - If **NO** (e.g., PostgreSQL, MySQL, Redis, Worker): What volume paths need persistent storage (e.g., `/var/lib/postgresql/data`)?
-- **Environment Variables (`env`):** What environment variables does this service need (e.g., `DATABASE_URL`, `SECRET_KEY`, `POSTGRES_PASSWORD`)?
-
-### Path B: User Does NOT Have Docker Images (Guided Containerization)
-If the user only has source code and doesn't know Docker or GHCR, guide them step-by-step:
-1. **Inspect or Ask About the Stack:** Check their project files or ask what frameworks they use (e.g., Next.js, React/Vite, Node.js/Express, NestJS, Python/Django/FastAPI, Go, Laravel) and what database they need (PostgreSQL, MySQL, MongoDB, Redis).
-2. **Generate `Dockerfile` & `.dockerignore`:**
-   - Write clean, production-optimized `Dockerfile` and `.dockerignore` files for each custom service (e.g., Frontend and Backend).
-   - Clearly note the internal port exposed by the `Dockerfile` (e.g., `EXPOSE 3000`).
-3. **Automate Image Building via GitHub Container Registry (GHCR):**
-   - Generate a `.github/workflows/publish-ghcr.yml` file in their application repository that automatically builds and pushes the Docker image(s) to `ghcr.io/<github_username>/<repo_name>:latest` whenever code is pushed to `main`.
-   - Guide the user to commit and push their code to GitHub.
-   - If their GitHub repository/package is private, guide them on how to create a GitHub **Personal Access Token (Classic)** with the `read:packages` scope (Settings -> Developer settings -> Personal access tokens -> Tokens (classic)), and collect their GitHub username and token.
+1. **Backend Service (`backend`)**:
+   * Image: e.g., `ghcr.io/ehmoeini/persu-backend:latest`
+   * Published Port: `8000:8000` (`mode: ingress`)
+   * Replicas: `1` to `3`
+   * Gunicorn concurrency: `GUNICORN_WORKERS: "3"`
+   * Dependencies: `db`, `redis`
+   * Resources: Limits `memory: 768M, cpus: '1.0'`; Reservations `memory: 256M, cpus: '0.25'`
+2. **Frontend Service (`frontend`)**:
+   * Image: e.g., `ghcr.io/ehmoeini/persu-frontend:latest`
+   * Published Port: `3000:3000` (`mode: ingress`)
+   * Replicas: `1` to `2`
+   * Resources: Limits `memory: 512M, cpus: '0.75'`; Reservations `memory: 128M, cpus: '0.25'`
+3. **Database (`db`)**:
+   * Image: `postgres:17-alpine`
+   * Internal only (no published ports). Persistent volume: `postgres_data:/var/lib/postgresql/data`
+   * Placement constraint: `node.role == manager`
+   * Resources: Limits `memory: 1024M, cpus: '1.0'`; Reservations `memory: 256M, cpus: '0.25'`
+4. **Cache (`redis`)**:
+   * Image: `redis:7-alpine`
+   * Internal only (no published ports).
+   * Placement constraint: `node.role == manager`
+   * Resources: Limits `memory: 256M, cpus: '0.50'`; Reservations `memory: 64M, cpus: '0.10'`
 
 ---
 
-## Phase 5: Generating DeployKit Configuration Files
-Using the information gathered in Phases 2, 3, and 4, create/overwrite the two target files.
+## Phase 5: Generating Configuration Files
 
-### 5.1. Write `ansible/inventory/production/hosts.yml`
-Format it strictly as follows:
+### 5.1. Update `ansible/inventory/production/hosts.yml`
 ```yaml
 all:
   hosts:
     production_server:
-      ansible_host: "<SERVER_IP>"
-      ansible_port: <SSH_PORT>
-      ansible_user: "<DEPLOY_USER>"
-      ansible_ssh_private_key_file: "<PATH_TO_PRIVATE_SSH_KEY>"
+      ansible_host: "192.168.6.222"
+      ansible_port: 22
+      ansible_user: "deploy"
+      ansible_ssh_private_key_file: "~/.ssh/id_ed25519"
+      ansible_ssh_common_args: "-o StrictHostKeyChecking=accept-new"
 ```
 
-### 5.2. Write `ansible/inventory/production/group_vars/all.yml`
-Ensure directory `ansible/inventory/production/group_vars/` exists, then write `all.yml` following the exact schema in `ansible/inventory/example/group_vars_all.yml.example`:
-- Set `ssh_port`, `deploy_user`, `acme_email`, and `traefik_network: "traefik_proxy"`.
-- If private registry images are used, set `registry_auth_enabled: true`, `registry_url: "ghcr.io"`, `registry_username`, and `registry_token`.
-- Define `app_named_volumes` for any database/storage volumes.
-- Populate `app_services` with every frontend, backend, and database service, matching internal service hostnames in environment variables (e.g., using `db` as the database host in `DATABASE_URL`).
-
-Show a brief summary of the configuration (masking sensitive passwords/tokens) to the user and ask for confirmation to start the deployment.
+### 5.2. Update `ansible/inventory/production/group_vars/all.yml`
+Ensure all services have:
+* Proper environment variables (`DB_HOST: "db"`, `REDIS_URL: "redis://redis:6379/1"`, `DJANGO_BEHIND_PROXY: "true"`).
+* Defined `resources` (limits and reservations).
+* Appropriate `replicas` and `ports` mapped.
 
 ---
 
 ## Phase 6: Execution & Post-Deployment Verification
-1. **Run the Full Playbook:**
-   Execute the deployment from the root of the DeployKit repository:
+
+1. **Deploy Full Playbook**:
    ```bash
    ANSIBLE_CONFIG=ansible/ansible.cfg ansible-playbook -i ansible/inventory/production/hosts.yml ansible/playbooks/site.yml
    ```
-   *(Note: If the server was already provisioned previously and the user only wants to update their application containers or environment variables, run with `--tags app` for fast deployment:)*
-   ```bash
-   ANSIBLE_CONFIG=ansible/ansible.cfg ansible-playbook -i ansible/inventory/production/hosts.yml ansible/playbooks/site.yml --tags app
-   ```
+   *(For fast application-only redeployments: add `--tags app`)*
 
-2. **Verify Deployment Health:**
-   After the playbook finishes, run a quick health check via SSH:
+2. **Verify Swarm Services via SSH**:
    ```bash
-   ssh -p <SSH_PORT> <DEPLOY_USER>@<SERVER_IP> "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
+   # Check service replica status (e.g., 2/2 replicas Up)
+   ssh -p <SSH_PORT> <DEPLOY_USER>@<SERVER_IP> "docker stack services <app_name>"
+
+   # Inspect individual tasks and health
+   ssh -p <SSH_PORT> <DEPLOY_USER>@<SERVER_IP> "docker stack ps <app_name>"
+
+   # View service logs
+   ssh -p <SSH_PORT> <DEPLOY_USER>@<SERVER_IP> "docker service logs --tail 50 <app_name>_backend"
+   ssh -p <SSH_PORT> <DEPLOY_USER>@<SERVER_IP> "docker service logs --tail 50 <app_name>_frontend"
    ```
-   - Confirm that `traefik` and all `<app_name>_<service>` containers are `Up`.
-   - If any container is restarting or unhealthy, fetch its logs using:
-     ```bash
-     ssh -p <SSH_PORT> <DEPLOY_USER>@<SERVER_IP> "docker logs --tail 50 <CONTAINER_NAME>"
-     ```
-     Diagnose the issue for the user, update `group_vars/all.yml` if needed, and re-run with `--tags app`.
