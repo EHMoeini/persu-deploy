@@ -20,19 +20,28 @@ registry_token: ""
 # ==========================================
 app_name: "my_web_app"
 app_dir: "/opt/app"
+docker_swarm_task_history_limit: 1
+app_prune_images_until: "24h"
 
 # Persistent named volumes (e.g. databases, uploads)
 app_named_volumes:
   - "postgres_data"
-  # - "redis_data"
 
-# Application services (frontend, backend, database, etc.)
+# Application services (frontend, backend, database, cache)
 app_services:
   - name: "frontend"
     image: "ghcr.io/username/frontend:latest"
     replicas: 2
+    auto_update: true
+    update_order: "start-first"
     ports:
       - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ || exit 1"]
+      interval: "15s"
+      timeout: "5s"
+      retries: 3
+      start_period: "25s"
     resources:
       reservations:
         cpus: "0.25"
@@ -45,14 +54,20 @@ app_services:
       PORT: "3000"
       NEXT_PUBLIC_API_BASE_URL: "https://api.example.com"
     volumes: []
-    depends_on:
-      - "backend"
 
   - name: "backend"
     image: "ghcr.io/username/backend:latest"
     replicas: 2
+    auto_update: false # Keep false when releases include decoupled DB migrations
+    update_order: "start-first"
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/', timeout=3)\" || exit 1"]
+      interval: "15s"
+      timeout: "5s"
+      retries: 3
+      start_period: "30s"
     resources:
       reservations:
         cpus: "0.25"
@@ -61,17 +76,26 @@ app_services:
         cpus: "1.0"
         memory: "768M"
     env:
-      DATABASE_URL: "postgresql://postgres:secretpassword@db:5432/appdb"
-      PORT: "8000"
+      DB_HOST: "db"
+      DB_PORT: "5432"
+      REDIS_URL: "redis://redis:6379/1"
+      DJANGO_BEHIND_PROXY: "true"
+      GUNICORN_WORKERS: "3"
     volumes: []
-    depends_on:
-      - "db"
 
   - name: "db"
     image: "postgres:17-alpine"
     replicas: 1
+    auto_update: false
+    update_order: "stop-first"
     placement_constraints:
       - "node.role == manager"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-appdb}"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 5
+      start_period: "20s"
     resources:
       reservations:
         cpus: "0.25"
@@ -85,4 +109,23 @@ app_services:
       POSTGRES_DB: "appdb"
     volumes:
       - "postgres_data:/var/lib/postgresql/data"
-    depends_on: []
+
+  - name: "redis"
+    image: "redis:7-alpine"
+    replicas: 1
+    auto_update: false
+    update_order: "stop-first"
+    placement_constraints:
+      - "node.role == manager"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: "10s"
+      timeout: "3s"
+      retries: 5
+    resources:
+      reservations:
+        cpus: "0.10"
+        memory: "64M"
+      limits:
+        cpus: "0.50"
+        memory: "256M"

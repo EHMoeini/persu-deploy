@@ -15,22 +15,32 @@ registry_username: ""
 registry_token: ""
 
 # ==========================================
-# 3. Application Stack (Docker Swarm)
+# 3. Application Stack
 # ==========================================
 app_name: "persu"
 app_dir: "/opt/app"
+docker_swarm_task_history_limit: 1
+app_prune_images_until: "24h"
 
 # Persistent named volumes
 app_named_volumes:
   - "postgres_data"
 
-# Application services configured for Docker Swarm
+# Application services
 app_services:
   - name: "db"
     image: "postgres:17-alpine"
     replicas: 1
+    auto_update: false
+    update_order: "stop-first"
     placement_constraints:
       - "node.role == manager"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-persu}"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 5
+      start_period: "20s"
     resources:
       reservations:
         cpus: "0.25"
@@ -38,25 +48,25 @@ app_services:
       limits:
         cpus: "1.0"
         memory: "1024M"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U persu -d persu"]
-      interval: "5s"
-      timeout: "5s"
-      retries: 5
     env:
       POSTGRES_DB: "persu"
       POSTGRES_USER: "persu"
       POSTGRES_PASSWORD: "iggbJTLg-8jw-NaN7jmLmGzxJq5jQK09"
     volumes:
       - "postgres_data:/var/lib/postgresql/data"
-    depends_on: []
 
   - name: "redis"
     image: "redis:7-alpine"
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
     replicas: 1
+    auto_update: false
+    update_order: "stop-first"
     placement_constraints:
       - "node.role == manager"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: "10s"
+      timeout: "3s"
+      retries: 5
     resources:
       reservations:
         cpus: "0.10"
@@ -64,21 +74,23 @@ app_services:
       limits:
         cpus: "0.50"
         memory: "256M"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: "5s"
-      timeout: "3s"
-      retries: 5
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
     env: {}
     volumes: []
-    depends_on: []
 
   - name: "backend"
     image: "ghcr.io/ehmoeini/persu-backend:latest"
     replicas: 2
+    auto_update: false
+    update_order: "start-first"
     ports:
       - "8000:8000"
-    command: ["sh", "-c", "until python -c \"import socket; s = socket.create_connection(('db', 5432), timeout=2); s.close()\" 2>/dev/null; do echo 'Waiting for postgres...'; sleep 1; done; exec gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers ${GUNICORN_WORKERS:-3} --timeout ${GUNICORN_TIMEOUT:-60} --access-logfile - --error-logfile -"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)\" || exit 1"]
+      interval: "15s"
+      timeout: "5s"
+      retries: 3
+      start_period: "30s"
     resources:
       reservations:
         cpus: "0.25"
@@ -86,16 +98,8 @@ app_services:
       limits:
         cpus: "1.0"
         memory: "768M"
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)\""]
-      interval: "10s"
-      timeout: "5s"
-      retries: 3
-      start_period: "30s"
+    command: ["sh", "-c", "until python -c \"import socket; s = socket.create_connection(('db', 5432), timeout=2); s.close()\" 2>/dev/null; do echo 'Waiting for postgres...'; sleep 1; done; exec gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers ${GUNICORN_WORKERS:-3} --timeout ${GUNICORN_TIMEOUT:-60} --access-logfile - --error-logfile -"]
     volumes: []
-    depends_on:
-      - "db"
-      - "redis"
     env:
       DB_ENGINE: "postgresql"
       DB_HOST: "db"
@@ -120,8 +124,16 @@ app_services:
   - name: "frontend"
     image: "ghcr.io/ehmoeini/persu-frontend:latest"
     replicas: 2
+    auto_update: true
+    update_order: "start-first"
     ports:
       - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ || exit 1"]
+      interval: "15s"
+      timeout: "5s"
+      retries: 3
+      start_period: "25s"
     resources:
       reservations:
         cpus: "0.25"
@@ -129,15 +141,7 @@ app_services:
       limits:
         cpus: "0.75"
         memory: "512M"
-    healthcheck:
-      test: ["CMD-SHELL", "node -e \"require('http').get('http://127.0.0.1:3000', (r) => {process.exit(r.statusCode < 400 ? 0 : 1)}).on('error', () => process.exit(1))\""]
-      interval: "10s"
-      timeout: "5s"
-      retries: 3
-      start_period: "20s"
     volumes: []
-    depends_on:
-      - "backend"
     env:
       NODE_ENV: "production"
       PORT: "3000"

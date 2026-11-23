@@ -10,3 +10,4 @@ docker_packages:
   - docker-compose-plugin
 docker_users:
   - "{{ deploy_user | default(ansible_user | default('ubuntu')) }}"
+docker_swarm_task_history_limit: 1

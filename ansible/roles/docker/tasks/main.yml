@@ -122,19 +122,20 @@
         ]
       }
     mode: '0644'
+  notify: Restart docker
 
-- name: "Reload systemd configuration"
-  ansible.builtin.systemd:
-    daemon_reload: true
-
-- name: "Ensure docker.socket and docker.service are enabled and restarted with active mirrors"
+- name: "Ensure docker.socket and docker.service are enabled and running"
   ansible.builtin.systemd:
     name: "{{ item }}"
-    state: restarted
+    state: started
     enabled: true
+    daemon_reload: true
   loop:
     - docker.socket
     - docker.service
+
+- name: "Flush handlers before initializing Swarm"
+  ansible.builtin.meta: flush_handlers
 
 - name: "Add designated users to docker group"
   ansible.builtin.user:
@@ -143,7 +144,16 @@
     append: true
   loop: "{{ docker_users }}"
 
-- name: "Ensure Docker Swarm is initialized"
+- name: "Ensure Python Docker Swarm dependencies (jsondiff, pyyaml) are installed"
+  ansible.builtin.package:
+    name:
+      - python3-jsondiff
+      - python3-yaml
+    state: present
+  ignore_errors: true
+
+- name: "Ensure Docker Swarm is initialized with tight task history retention"
   community.docker.docker_swarm:
     state: present
     advertise_addr: "{{ ansible_host | default(ansible_default_ipv4.address) }}"
+    task_history_retention_limit: "{{ docker_swarm_task_history_limit | default(1) }}"

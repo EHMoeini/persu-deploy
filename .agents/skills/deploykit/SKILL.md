@@ -46,6 +46,12 @@ Agents reading this skill must understand the specific deployment environment:
   * A deployment lock (`/var/run/deploykit-<app_name>.lock`) is acquired at the start and released upon completion (or failure) to prevent concurrent deployments and migration collisions.
 * **Startup Ordering**:
   * Docker Swarm ignores Compose healthcheck-based `depends_on`. The backend container startup script verifies PostgreSQL TCP connectivity (via socket check) before starting Gunicorn.
+* **Rolling Updates & Dead Container Cleanup**:
+  * Stack deployments run with `resolve_image: always`, `prune: true`, and `with_registry_auth`, using `order: start-first` for stateless services (`frontend`, `backend`) and `order: stop-first` for stateful services (`db`, `redis`).
+  * Swarm task history is capped via `docker_swarm_task_history_limit: 1`, and post-deploy tasks prune stopped task containers and stale images older than `24h`.
+* **Auto-Update Strategy**:
+  * Do NOT use Watchtower on Docker Swarm.
+  * Use Swarm-native **Shepherd** (`shepherd.enable` label set via `auto_update` per service) for stateless services (`frontend`) and a migration-safe cron/CI workflow for `backend`.
 
 ---
 
@@ -59,7 +65,7 @@ Agents reading this skill must understand the specific deployment environment:
      2. `ansible/inventory/production/group_vars/all.yml`
    * **Swarm Orchestration Files**: Maintain and adapt:
      1. `ansible/roles/app/tasks/main.yml` (Swarm initialization via `community.docker.docker_swarm` and deployment via `community.docker.docker_stack`)
-     2. `ansible/roles/app/templates/docker-stack.yml.j2` (or `docker-compose.yml.j2` with Swarm `deploy` specs)
+     2. `ansible/roles/app/templates/docker-stack.yml.j2`
    * **Application Source Directories**: If containerization is needed, create `Dockerfile`, `.dockerignore`, or `.github/workflows/publish-ghcr.yml` inside the respective project directories.
 
 ---

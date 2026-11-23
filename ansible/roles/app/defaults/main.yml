@@ -5,5 +5,7 @@ registry_auth_enabled: false
 registry_url: "ghcr.io"
 registry_username: ""
 registry_token: ""
+docker_swarm_task_history_limit: 1
+app_prune_images_until: "24h"
 app_named_volumes: []
 app_services: []

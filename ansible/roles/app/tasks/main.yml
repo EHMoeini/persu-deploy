@@ -31,6 +31,24 @@
           - app_services is defined and app_services | length > 0
         fail_msg: "Required variables app_name, app_dir, or app_services are missing."
 
+    - name: "Ensure Python dependencies for Docker Swarm (jsondiff, pyyaml) are installed"
+      block:
+        - name: "Install python3-jsondiff via system package manager"
+          ansible.builtin.package:
+            name:
+              - python3-jsondiff
+              - python3-yaml
+            state: present
+      rescue:
+        - name: "Install jsondiff via pip fallback if distro package is missing"
+          ansible.builtin.pip:
+            name:
+              - jsondiff
+              - PyYAML
+            state: present
+            extra_args: "--break-system-packages"
+          ignore_errors: true
+
     - name: "Ensure application directory exists"
       ansible.builtin.file:
         path: "{{ app_dir }}"
@@ -39,10 +57,11 @@
         group: "{{ deploy_user | default(ansible_user) }}"
         mode: "0750"
 
-    - name: "Ensure Docker Swarm is initialized"
+    - name: "Ensure Docker Swarm is initialized with tight task history retention"
       community.docker.docker_swarm:
         state: present
         advertise_addr: "{{ ansible_host | default(ansible_default_ipv4.address) }}"
+        task_history_retention_limit: "{{ docker_swarm_task_history_limit | default(1) }}"
 
     - name: "Ensure application overlay network exists"
       community.docker.docker_network:
@@ -70,7 +89,7 @@
       ansible.builtin.set_fact:
         backend_service: "{{ (app_services | selectattr('name', 'equalto', 'backend') | list | first) | default(none) }}"
 
-    - name: "Pull backend image for migration and deployment"
+    - name: "Pull latest backend image for pre-deployment migrations"
       community.docker.docker_image:
         name: "{{ backend_service.image }}"
         source: pull
@@ -93,18 +112,30 @@
       block:
         - name: "Check if database service is running in Docker Swarm"
           ansible.builtin.command: >-
-            docker service ls --filter name={{ app_name }}_db --format "{{ '{{.Name}}' }}"
+            docker service ls --filter name={{ app_name }}_db --format "{% raw %}{{.Name}}{% endraw %}"
           register: db_service_check
           changed_when: false
           failed_when: false
 
         - name: "Bootstrap stack for database initialization (initial cold start)"
-          community.docker.docker_stack:
-            state: present
-            name: "{{ app_name }}"
-            compose:
-              - "{{ app_dir }}/docker-stack.yml"
           when: db_service_check.stdout == ""
+          block:
+            - name: "Bootstrap stack using community.docker.docker_stack"
+              community.docker.docker_stack:
+                state: present
+                name: "{{ app_name }}"
+                compose:
+                  - "{{ app_dir }}/docker-stack.yml"
+                resolve_image: always
+                with_registry_auth: "{{ registry_auth_enabled | bool }}"
+          rescue:
+            - name: "Bootstrap stack using docker stack CLI fallback"
+              ansible.builtin.command: >-
+                docker stack deploy
+                --compose-file {{ app_dir }}/docker-stack.yml
+                --resolve-image always
+                {% if registry_auth_enabled | bool %}--with-registry-auth{% endif %}
+                {{ app_name }}
 
         - name: "Define unique migration container name"
           ansible.builtin.set_fact:
@@ -165,36 +196,94 @@
             success_msg: "[MIGRATION SUCCESS] Database migrations completed successfully."
 
     # ==============================================================================
-    # Step 5: Deploy / Update Application Stack to Docker Swarm
+    # Step 5: Deploy / Rolling-Update Application Stack to Docker Swarm
     # ==============================================================================
     - name: "Deploy application stack to Docker Swarm"
-      community.docker.docker_stack:
-        state: present
-        name: "{{ app_name }}"
-        compose:
-          - "{{ app_dir }}/docker-stack.yml"
-        prune: true
       when: app_services | length > 0
+      block:
+        - name: "Deploy application stack using community.docker.docker_stack"
+          community.docker.docker_stack:
+            state: present
+            name: "{{ app_name }}"
+            compose:
+              - "{{ app_dir }}/docker-stack.yml"
+            prune: true
+            resolve_image: always
+            with_registry_auth: "{{ registry_auth_enabled | bool }}"
+      rescue:
+        - name: "Deploy application stack using docker stack CLI fallback"
+          ansible.builtin.command: >-
+            docker stack deploy
+            --compose-file {{ app_dir }}/docker-stack.yml
+            --prune
+            --resolve-image always
+            {% if registry_auth_enabled | bool %}--with-registry-auth{% endif %}
+            {{ app_name }}
 
     # ==============================================================================
-    # Step 6 & 7: Service Health Verification & Status Report
+    # Step 6: Wait for Rolling Updates to Complete & Detect Rollbacks
     # ==============================================================================
-    - name: "Wait for Swarm services to converge and verify replica status"
+    - name: "Allow Swarm scheduler to initiate service updates"
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: "Wait until all Swarm rolling updates finish"
+      ansible.builtin.shell: |
+        set -o pipefail
+        ids=$(docker stack services -q {{ app_name }})
+        if [ -n "$ids" ]; then
+          docker service inspect --format '{% raw %}{{.Spec.Name}}|{{if .UpdateStatus}}{{.UpdateStatus.State}}{{else}}none{{end}}{% endraw %}' $ids
+        fi
+      args:
+        executable: /bin/bash
+      register: swarm_update_states
+      until: >-
+        swarm_update_states.stdout_lines | length > 0 and
+        (swarm_update_states.stdout_lines | select('search', '\\|(updating|rollback_started)$') | list | length == 0)
+      retries: 40
+      delay: 5
+      changed_when: false
+
+    - name: "Fail if any service paused or rolled back during update"
+      ansible.builtin.assert:
+        that:
+          - (swarm_update_states.stdout_lines | select('search', '\\|(paused|rollback_completed)$') | list | length) == 0
+        fail_msg: >-
+          [ROLLING UPDATE FAILED] One or more Swarm services paused or rolled back:
+          {{ swarm_update_states.stdout_lines }}
+
+    - name: "Verify all Swarm services reached desired replica counts"
       ansible.builtin.command: >-
-        docker service ls --filter label=com.docker.stack.namespace={{ app_name }} --format "{{ '{{.Name}}: {{.Replicas}}' }}"
+        docker service ls
+        --filter label=com.docker.stack.namespace={{ app_name }}
+        --format "{% raw %}{{.Name}}: {{.Replicas}}{% endraw %}"
       register: swarm_services_status
       until: >-
         swarm_services_status.stdout_lines | length > 0 and
-        (swarm_services_status.stdout_lines | reject('search', '^.*:\s*([0-9]+)/\1$') | list | length == 0)
-      retries: 30
+        (swarm_services_status.stdout_lines | reject('search', '^.*:\\s*([0-9]+)/\\1$') | list | length == 0)
+      retries: 20
       delay: 5
       changed_when: false
+
+    # ==============================================================================
+    # Step 7: Cleanup Dead Containers & Stale Images
+    # ==============================================================================
+    - name: "Remove dead/stopped Swarm task containers"
+      ansible.builtin.command: docker container prune -f
+      register: container_prune_out
+      changed_when: "'Total reclaimed space: 0B' not in container_prune_out.stdout"
+
+    - name: "Remove unused Docker images older than {{ app_prune_images_until | default('24h') }}"
+      ansible.builtin.command: >-
+        docker image prune -a -f --filter "until={{ app_prune_images_until | default('24h') }}"
+      register: image_prune_out
+      changed_when: "'Total reclaimed space: 0B' not in image_prune_out.stdout"
 
     - name: "Report deployment success and verified service replicas"
       ansible.builtin.debug:
         msg:
           - "========================================================================"
-          - "✅ Application Stack '{{ app_name }}' Deployed Successfully to Docker Swarm!"
+          - "Application Stack '{{ app_name }}' Deployed Successfully to Docker Swarm"
           - "========================================================================"
           - "{{ swarm_services_status.stdout_lines }}"
 
