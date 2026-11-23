@@ -1,0 +1,100 @@
+version: "3.8"
+
+services:
+{% for service in app_services %}
+  {{ service.name }}:
+    image: {{ service.image }}
+{% if service.command is defined and service.command %}
+    command: {{ service.command | to_json }}
+{% endif %}
+    networks:
+      - internal
+{% if service.env is defined and service.env %}
+    environment:
+{% for key, value in service.env.items() %}
+      {{ key }}: {{ (value | string) | to_json }}
+{% endfor %}
+{% endif %}
+{% if service.volumes is defined and service.volumes %}
+    volumes:
+{% for vol in service.volumes %}
+      - {{ vol | to_json }}
+{% endfor %}
+{% endif %}
+{% if service.ports is defined and service.ports %}
+    ports:
+{% for port in service.ports %}
+{% if ':' in (port | string) %}
+      - target: {{ (port | string).split(':')[1] }}
+        published: {{ (port | string).split(':')[0] }}
+        protocol: tcp
+        mode: ingress
+{% else %}
+      - target: {{ port }}
+        published: {{ port }}
+        protocol: tcp
+        mode: ingress
+{% endif %}
+{% endfor %}
+{% elif service.port is defined and service.port %}
+    ports:
+{% if ':' in (service.port | string) %}
+      - target: {{ (service.port | string).split(':')[1] }}
+        published: {{ (service.port | string).split(':')[0] }}
+        protocol: tcp
+        mode: ingress
+{% else %}
+      - target: {{ service.port }}
+        published: {{ service.port }}
+        protocol: tcp
+        mode: ingress
+{% endif %}
+{% endif %}
+{% if service.healthcheck is defined and service.healthcheck %}
+    healthcheck:
+      test: {{ service.healthcheck.test | to_json }}
+      interval: {{ service.healthcheck.interval | default('10s') }}
+      timeout: {{ service.healthcheck.timeout | default('5s') }}
+      retries: {{ service.healthcheck.retries | default(3) }}
+      start_period: {{ service.healthcheck.start_period | default('30s') }}
+{% endif %}
+    deploy:
+      replicas: {{ service.replicas | default(1) }}
+      restart_policy:
+        condition: {{ service.restart_policy | default('on-failure') }}
+      update_config:
+        parallelism: {{ (service.update_config.parallelism if (service.update_config is defined and service.update_config.parallelism is defined) else 1) }}
+        delay: {{ (service.update_config.delay if (service.update_config is defined and service.update_config.delay is defined) else '10s') }}
+        order: {{ (service.update_config.order if (service.update_config is defined and service.update_config.order is defined) else 'start-first') }}
+        failure_action: {{ (service.update_config.failure_action if (service.update_config is defined and service.update_config.failure_action is defined) else 'rollback') }}
+      rollback_config:
+        parallelism: 1
+        order: stop-first
+      resources:
+        reservations:
+          cpus: '{{ (service.resources.reservations.cpus if (service.resources is defined and service.resources.reservations is defined and service.resources.reservations.cpus is defined) else "0.1") }}'
+          memory: '{{ (service.resources.reservations.memory if (service.resources is defined and service.resources.reservations is defined and service.resources.reservations.memory is defined) else "128M") }}'
+        limits:
+          cpus: '{{ (service.resources.limits.cpus if (service.resources is defined and service.resources.limits is defined and service.resources.limits.cpus is defined) else "0.5") }}'
+          memory: '{{ (service.resources.limits.memory if (service.resources is defined and service.resources.limits is defined and service.resources.limits.memory is defined) else "512M") }}'
+{% if service.placement_constraints is defined and service.placement_constraints %}
+      placement:
+        constraints:
+{% for constraint in service.placement_constraints %}
+          - {{ constraint }}
+{% endfor %}
+{% endif %}
+
+{% endfor %}
+networks:
+  internal:
+    name: "{{ app_name }}_internal"
+    driver: overlay
+    attachable: true
+
+{% if app_named_volumes is defined and app_named_volumes | length > 0 %}
+volumes:
+{% for vol_name in app_named_volumes %}
+  {{ vol_name }}:
+{% endfor %}
+{% endif %}

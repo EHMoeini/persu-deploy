@@ -38,8 +38,14 @@ Agents reading this skill must understand the specific deployment environment:
   * Database (`db`, PostgreSQL on port `5432`) and Cache (`redis` on port `6379`) must **never** publish ports to the host. They communicate solely over the private Swarm `overlay` network (`attachable: true`).
 * **Resource Limits & Reservations**:
   * Explicit CPU and Memory limits/reservations must be configured on all services (`db`, `redis`, `backend`, `frontend`) to safeguard the host against Out-Of-Memory (OOM) crashes.
+* **Decoupled Database Migrations (Pre-Deployment)**:
+  * Django migrations are **never** executed inside backend replica startup commands to prevent race conditions during multi-replica rolling updates.
+  * DeployKit executes migrations via a dedicated, temporary one-off Docker container attached to the Swarm overlay network prior to rolling out the stack update.
+  * If migrations fail, the deployment is immediately aborted, keeping running backend services untouched.
+* **Deployment Concurrency Lock**:
+  * A deployment lock (`/var/run/deploykit-<app_name>.lock`) is acquired at the start and released upon completion (or failure) to prevent concurrent deployments and migration collisions.
 * **Startup Ordering**:
-  * Docker Swarm ignores Compose healthcheck-based `depends_on`. The backend container startup script must verify PostgreSQL TCP connectivity (via socket check) before executing migrations.
+  * Docker Swarm ignores Compose healthcheck-based `depends_on`. The backend container startup script verifies PostgreSQL TCP connectivity (via socket check) before starting Gunicorn.
 
 ---
 
@@ -115,8 +121,9 @@ Gather or verify the service components for the Docker Swarm stack:
 1. **Backend Service (`backend`)**:
    * Image: e.g., `ghcr.io/ehmoeini/persu-backend:latest`
    * Published Port: `8000:8000` (`mode: ingress`)
-   * Replicas: `1` to `3`
+   * Replicas: `2` (recommended for zero-downtime rolling updates)
    * Gunicorn concurrency: `GUNICORN_WORKERS: "3"`
+   * Startup command: Pre-flight database socket check followed directly by Gunicorn startup (`python manage.py migrate` is decoupled).
    * Dependencies: `db`, `redis`
    * Resources: Limits `memory: 768M, cpus: '1.0'`; Reservations `memory: 256M, cpus: '0.25'`
 2. **Frontend Service (`frontend`)**:

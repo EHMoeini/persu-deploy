@@ -15,7 +15,7 @@ registry_username: ""
 registry_token: ""
 
 # ==========================================
-# 3. Application Stack
+# 3. Application Stack (Docker Swarm)
 # ==========================================
 app_name: "persu"
 app_dir: "/opt/app"
@@ -24,10 +24,25 @@ app_dir: "/opt/app"
 app_named_volumes:
   - "postgres_data"
 
-# Application services
+# Application services configured for Docker Swarm
 app_services:
   - name: "db"
     image: "postgres:17-alpine"
+    replicas: 1
+    placement_constraints:
+      - "node.role == manager"
+    resources:
+      reservations:
+        cpus: "0.25"
+        memory: "256M"
+      limits:
+        cpus: "1.0"
+        memory: "1024M"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U persu -d persu"]
+      interval: "5s"
+      timeout: "5s"
+      retries: 5
     env:
       POSTGRES_DB: "persu"
       POSTGRES_USER: "persu"
@@ -39,15 +54,44 @@ app_services:
   - name: "redis"
     image: "redis:7-alpine"
     command: ["redis-server", "--save", "", "--appendonly", "no"]
+    replicas: 1
+    placement_constraints:
+      - "node.role == manager"
+    resources:
+      reservations:
+        cpus: "0.10"
+        memory: "64M"
+      limits:
+        cpus: "0.50"
+        memory: "256M"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: "5s"
+      timeout: "3s"
+      retries: 5
     env: {}
     volumes: []
     depends_on: []
 
   - name: "backend"
     image: "ghcr.io/ehmoeini/persu-backend:latest"
+    replicas: 2
     ports:
       - "8000:8000"
-    command: ["sh", "-c", "until python -c \"import socket; s = socket.create_connection(('db', 5432), timeout=2); s.close()\" 2>/dev/null; do echo 'Waiting for postgres...'; sleep 1; done; python manage.py migrate --noinput && exec gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers ${GUNICORN_WORKERS:-3} --timeout ${GUNICORN_TIMEOUT:-60} --access-logfile - --error-logfile -"]
+    command: ["sh", "-c", "until python -c \"import socket; s = socket.create_connection(('db', 5432), timeout=2); s.close()\" 2>/dev/null; do echo 'Waiting for postgres...'; sleep 1; done; exec gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers ${GUNICORN_WORKERS:-3} --timeout ${GUNICORN_TIMEOUT:-60} --access-logfile - --error-logfile -"]
+    resources:
+      reservations:
+        cpus: "0.25"
+        memory: "256M"
+      limits:
+        cpus: "1.0"
+        memory: "768M"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)\""]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "30s"
     volumes: []
     depends_on:
       - "db"
@@ -75,8 +119,22 @@ app_services:
 
   - name: "frontend"
     image: "ghcr.io/ehmoeini/persu-frontend:latest"
+    replicas: 2
     ports:
       - "3000:3000"
+    resources:
+      reservations:
+        cpus: "0.25"
+        memory: "128M"
+      limits:
+        cpus: "0.75"
+        memory: "512M"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://127.0.0.1:3000', (r) => {process.exit(r.statusCode < 400 ? 0 : 1)}).on('error', () => process.exit(1))\""]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "20s"
     volumes: []
     depends_on:
       - "backend"

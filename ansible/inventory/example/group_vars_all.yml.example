@@ -7,14 +7,7 @@ ssh_port: 22
 deploy_user: "deploy"
 
 # ==========================================
-# 2. Traefik & SSL/TLS Settings
-# ==========================================
-acme_email: "admin@example.com"
-traefik_network: "traefik_proxy"
-traefik_dir: "/opt/traefik"
-
-# ==========================================
-# 3. Container Registry Auth (GHCR / Docker Hub)
+# 2. Container Registry Auth (GHCR / Docker Hub)
 # Set registry_auth_enabled to true for private images
 # ==========================================
 registry_auth_enabled: false
@@ -23,7 +16,7 @@ registry_username: ""
 registry_token: ""
 
 # ==========================================
-# 4. Application Stack
+# 3. Application Stack (Docker Swarm)
 # ==========================================
 app_name: "my_web_app"
 app_dir: "/opt/app"
@@ -37,11 +30,19 @@ app_named_volumes:
 app_services:
   - name: "frontend"
     image: "ghcr.io/username/frontend:latest"
-    expose_public: true
-    domain: "example.com"
-    port: 3000
+    replicas: 2
+    ports:
+      - "3000:3000"
+    resources:
+      reservations:
+        cpus: "0.25"
+        memory: "128M"
+      limits:
+        cpus: "0.75"
+        memory: "512M"
     env:
       NODE_ENV: "production"
+      PORT: "3000"
       NEXT_PUBLIC_API_BASE_URL: "https://api.example.com"
     volumes: []
     depends_on:
@@ -49,9 +50,16 @@ app_services:
 
   - name: "backend"
     image: "ghcr.io/username/backend:latest"
-    expose_public: true
-    domain: "api.example.com"
-    port: 8000
+    replicas: 2
+    ports:
+      - "8000:8000"
+    resources:
+      reservations:
+        cpus: "0.25"
+        memory: "256M"
+      limits:
+        cpus: "1.0"
+        memory: "768M"
     env:
       DATABASE_URL: "postgresql://postgres:secretpassword@db:5432/appdb"
       PORT: "8000"
@@ -60,8 +68,17 @@ app_services:
       - "db"
 
   - name: "db"
-    image: "postgres:16-alpine"
-    expose_public: false
+    image: "postgres:17-alpine"
+    replicas: 1
+    placement_constraints:
+      - "node.role == manager"
+    resources:
+      reservations:
+        cpus: "0.25"
+        memory: "256M"
+      limits:
+        cpus: "1.0"
+        memory: "1024M"
     env:
       POSTGRES_USER: "postgres"
       POSTGRES_PASSWORD: "secretpassword"

@@ -1,35 +1,205 @@
 ---
-- name: "Ensure application directory exists"
-  ansible.builtin.file:
-    path: "{{ app_dir }}"
-    state: directory
-    owner: "{{ deploy_user | default(ansible_user) }}"
-    group: "{{ deploy_user | default(ansible_user) }}"
-    mode: "0750"
+# ==============================================================================
+# Step 1: Pre-Flight Validation & Deployment Concurrency Lock
+# ==============================================================================
+- name: "Preflight: Check for active deployment lock"
+  ansible.builtin.stat:
+    path: "/var/run/deploykit-{{ app_name }}.lock"
+  register: deploy_lock_stat
 
-- name: "Log in to Container Registry (GHCR / DockerHub) if private"
-  community.docker.docker_login:
-    registry_url: "{{ registry_url }}"
-    username: "{{ registry_username }}"
-    password: "{{ registry_token }}"
-    reauthorize: true
-  when:
-    - registry_auth_enabled | bool
-    - registry_username | length > 0
-    - registry_token | length > 0
+- name: "Fail if concurrent deployment is already in progress"
+  ansible.builtin.fail:
+    msg: >-
+      [DEPLOYMENT LOCK ERROR] Lock file '/var/run/deploykit-{{ app_name }}.lock' already exists!
+      Another deployment or migration is currently executing against this environment.
+      If a previous deployment crashed, verify cluster state and remove the lock file manually.
+  when: deploy_lock_stat.stat.exists
 
-- name: "Render application docker-compose.yml"
-  ansible.builtin.template:
-    src: docker-compose.yml.j2
-    dest: "{{ app_dir }}/docker-compose.yml"
-    owner: "{{ deploy_user | default(ansible_user) }}"
-    group: "{{ deploy_user | default(ansible_user) }}"
-    mode: "0640"
+- name: "Deployment execution block"
+  block:
+    - name: "Acquire deployment lock"
+      ansible.builtin.copy:
+        dest: "/var/run/deploykit-{{ app_name }}.lock"
+        content: "Locked by DeployKit for {{ app_name }} at {{ ansible_date_time.iso8601 | default('now') }}\n"
+        mode: "0644"
 
-- name: "Pull and deploy application services"
-  community.docker.docker_compose_v2:
-    project_src: "{{ app_dir }}"
-    pull: always
-    remove_orphans: true
-    state: present
-  when: app_services | length > 0
+    - name: "Preflight: Validate required deployment variables"
+      ansible.builtin.assert:
+        that:
+          - app_name is defined and app_name | length > 0
+          - app_dir is defined and app_dir | length > 0
+          - app_services is defined and app_services | length > 0
+        fail_msg: "Required variables app_name, app_dir, or app_services are missing."
+
+    - name: "Ensure application directory exists"
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ deploy_user | default(ansible_user) }}"
+        group: "{{ deploy_user | default(ansible_user) }}"
+        mode: "0750"
+
+    - name: "Ensure Docker Swarm is initialized"
+      community.docker.docker_swarm:
+        state: present
+        advertise_addr: "{{ ansible_host | default(ansible_default_ipv4.address) }}"
+
+    - name: "Ensure application overlay network exists"
+      community.docker.docker_network:
+        name: "{{ app_name }}_internal"
+        driver: overlay
+        attachable: true
+        state: present
+
+    # ==============================================================================
+    # Step 2: Container Registry Login & Image Preparation
+    # ==============================================================================
+    - name: "Log in to Container Registry (GHCR / DockerHub) if private"
+      community.docker.docker_login:
+        registry_url: "{{ registry_url }}"
+        username: "{{ registry_username }}"
+        password: "{{ registry_token }}"
+        reauthorize: true
+      when:
+        - registry_auth_enabled | bool
+        - registry_username | length > 0
+        - registry_token | length > 0
+      no_log: true
+
+    - name: "Identify backend service configuration"
+      ansible.builtin.set_fact:
+        backend_service: "{{ (app_services | selectattr('name', 'equalto', 'backend') | list | first) | default(none) }}"
+
+    - name: "Pull backend image for migration and deployment"
+      community.docker.docker_image:
+        name: "{{ backend_service.image }}"
+        source: pull
+        force_source: true
+      when: backend_service is not none
+
+    - name: "Render application docker-stack.yml"
+      ansible.builtin.template:
+        src: docker-stack.yml.j2
+        dest: "{{ app_dir }}/docker-stack.yml"
+        owner: "{{ deploy_user | default(ansible_user) }}"
+        group: "{{ deploy_user | default(ansible_user) }}"
+        mode: "0640"
+
+    # ==============================================================================
+    # Step 3 & 4: Django Database Migrations (Decoupled Pre-Deployment Task)
+    # ==============================================================================
+    - name: "Execute database migrations block"
+      when: backend_service is not none
+      block:
+        - name: "Check if database service is running in Docker Swarm"
+          ansible.builtin.command: >-
+            docker service ls --filter name={{ app_name }}_db --format "{{ '{{.Name}}' }}"
+          register: db_service_check
+          changed_when: false
+          failed_when: false
+
+        - name: "Bootstrap stack for database initialization (initial cold start)"
+          community.docker.docker_stack:
+            state: present
+            name: "{{ app_name }}"
+            compose:
+              - "{{ app_dir }}/docker-stack.yml"
+          when: db_service_check.stdout == ""
+
+        - name: "Define unique migration container name"
+          ansible.builtin.set_fact:
+            migration_container_name: "{{ app_name }}_migration_{{ ansible_date_time.epoch | default('run') }}"
+
+        - name: "Run Django database migrations in a temporary one-off container"
+          community.docker.docker_container:
+            name: "{{ migration_container_name }}"
+            image: "{{ backend_service.image }}"
+            state: started
+            detach: false
+            auto_remove: false
+            networks:
+              - name: "{{ app_name }}_internal"
+            env: "{{ backend_service.env | default({}) }}"
+            command: >-
+              sh -c '
+                until python -c "import socket; s = socket.create_connection((\"{{ backend_service.env.DB_HOST | default(\"db\") }}\", {{ backend_service.env.DB_PORT | default(5432) }}), timeout=2); s.close()" 2>/dev/null; do
+                  echo "Waiting for database to accept connections...";
+                  sleep 1;
+                done;
+                python manage.py migrate --noinput
+              '
+          register: migration_result
+          failed_when: false
+          no_log: true
+
+        - name: "Capture migration container logs on failure"
+          ansible.builtin.command: "docker logs {{ migration_container_name }}"
+          register: migration_logs
+          when:
+            - migration_result.container.State.ExitCode is defined
+            - migration_result.container.State.ExitCode != 0
+          failed_when: false
+          changed_when: false
+
+        - name: "Display migration failure output"
+          ansible.builtin.debug:
+            var: migration_logs.stdout_lines
+          when:
+            - migration_result.container.State.ExitCode is defined
+            - migration_result.container.State.ExitCode != 0
+
+        - name: "Cleanup temporary migration container"
+          community.docker.docker_container:
+            name: "{{ migration_container_name }}"
+            state: absent
+          failed_when: false
+
+        - name: "Assert database migration succeeded"
+          ansible.builtin.assert:
+            that:
+              - migration_result.container.State.ExitCode is defined
+              - migration_result.container.State.ExitCode == 0
+            fail_msg: >-
+              [MIGRATION FAILED] Database migration container exited with code {{ migration_result.container.State.ExitCode | default('unknown') }}.
+              Aborting deployment! The running backend Swarm service has NOT been updated.
+            success_msg: "[MIGRATION SUCCESS] Database migrations completed successfully."
+
+    # ==============================================================================
+    # Step 5: Deploy / Update Application Stack to Docker Swarm
+    # ==============================================================================
+    - name: "Deploy application stack to Docker Swarm"
+      community.docker.docker_stack:
+        state: present
+        name: "{{ app_name }}"
+        compose:
+          - "{{ app_dir }}/docker-stack.yml"
+        prune: true
+      when: app_services | length > 0
+
+    # ==============================================================================
+    # Step 6 & 7: Service Health Verification & Status Report
+    # ==============================================================================
+    - name: "Wait for Swarm services to converge and verify replica status"
+      ansible.builtin.command: >-
+        docker service ls --filter label=com.docker.stack.namespace={{ app_name }} --format "{{ '{{.Name}}: {{.Replicas}}' }}"
+      register: swarm_services_status
+      until: >-
+        swarm_services_status.stdout_lines | length > 0 and
+        (swarm_services_status.stdout_lines | reject('search', '^.*:\s*([0-9]+)/\1$') | list | length == 0)
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: "Report deployment success and verified service replicas"
+      ansible.builtin.debug:
+        msg:
+          - "========================================================================"
+          - "✅ Application Stack '{{ app_name }}' Deployed Successfully to Docker Swarm!"
+          - "========================================================================"
+          - "{{ swarm_services_status.stdout_lines }}"
+
+  always:
+    - name: "Release deployment lock"
+      ansible.builtin.file:
+        path: "/var/run/deploykit-{{ app_name }}.lock"
+        state: absent
