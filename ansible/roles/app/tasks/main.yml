@@ -151,14 +151,16 @@
             networks:
               - name: "{{ app_name }}_internal"
             env: "{{ backend_service.env | default({}) }}"
-            command: >-
-              sh -c '
-                until python -c "import socket; s = socket.create_connection((\"{{ backend_service.env.DB_HOST | default(\"db\") }}\", {{ backend_service.env.DB_PORT | default(5432) }}), timeout=2); s.close()" 2>/dev/null; do
+            command:
+              - sh
+              - -c
+              - >-
+                until python -c "import os, socket; s = socket.create_connection((os.environ.get('DB_HOST') or 'db', int(os.environ.get('DB_PORT') or 5432)), timeout=2); s.close()" 2>/dev/null; do
                   echo "Waiting for database to accept connections...";
                   sleep 1;
                 done;
                 python manage.py migrate --noinput
-              '
+
           register: migration_result
           failed_when: false
           no_log: true
